@@ -1,0 +1,117 @@
+service: cognito-auth
+
+custom: 
+  stage: ${opt:stage, self:provider.stage, 'dev'} # Either the stage is specified via commandline, through provider.stage or defaults to "dev"
+
+provider:
+  name: aws
+  # By default it's nodejs12.x, but Hey, we're bleeding edge...
+  runtime: nodejs14.x 
+  # I'm situated in europe
+  region: eu-central-1
+
+  lambdaHashingVersion: 20201221
+
+resources:
+  Resources:
+    # The name that you will use to refer to this resource
+    # in this YAML file.
+    CognitoUserPool:
+        Type: AWS::Cognito::UserPool
+        Properties:
+            # The actual name of the user pool 
+            UserPoolName: ${self:custom.stage}-user-pool
+            # The username that users will have to use to login
+            UsernameAttributes:
+                - email
+            # What kind of attributes should be automatically verified
+            AutoVerifiedAttributes:
+                - email
+    
+    CognitoUserPoolWebClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties: 
+        TokenValidityUnits: # What unit each token validity is specified in
+          AccessToken: hours # default
+          IdToken: hours # default
+          RefreshToken: days # default
+        AccessTokenValidity: 1
+        IdTokenValidity: 1
+        RefreshTokenValidity: 30 
+        ClientName: ${self:custom.stage}-${self:service}-web-client
+        ExplicitAuthFlows: 
+          - ALLOW_USER_SRP_AUTH # default by aws-amplify
+          - ALLOW_REFRESH_TOKEN_AUTH # Allows user tokens to be refreshed
+        GenerateSecret: false
+        PreventUserExistenceErrors: ENABLED
+        SupportedIdentityProviders: 
+          - COGNITO
+        UserPoolId: !Ref CognitoUserPool
+
+    CognitoIdentityPool:
+      Type: AWS::Cognito::IdentityPool
+      Properties: 
+        AllowClassicFlow: false # https://docs.aws.amazon.com/cognito/latest/developerguide/authentication-flow.html
+        AllowUnauthenticatedIdentities: true
+        CognitoIdentityProviders: 
+          - ClientId: !Ref CognitoUserPoolWebClient
+            ProviderName: ${self:resources.Outputs.CognitoIdentityPoolProviderName.Value}
+            ServerSideTokenCheck: true
+        IdentityPoolName: ${self:custom.stage}-${self:service}
+
+    AuthenticatedRole:
+      Type: AWS::IAM::Role
+      Properties: 
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: "AllowCognitoAssumeAuthenticatedRole"
+              Effect: Allow
+              Principal:
+                Federated: cognito-identity.amazonaws.com
+              Action:
+                - 'sts:AssumeRoleWithWebIdentity'
+              Condition:
+                StringEquals:
+                  cognito-identity.amazonaws.com:aud: !Ref CognitoIdentityPool
+                ForAnyValue:StringLike:
+                  cognito-identity.amazonaws.com:amr: authenticated
+        RoleName: ${self:custom.stage}-${self:service}-authenticated-role
+    
+    UnauthenticatedRole:
+      Type: AWS::IAM::Role
+      Properties:
+          AssumeRolePolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Sid: "AllowCognitoAssumeUnauthenticatedRole"
+                  Effect: Allow
+                  Principal:
+                      Federated: cognito-identity.amazonaws.com
+                  Action:
+                      - 'sts:AssumeRoleWithWebIdentity'
+                  Condition:
+                      StringEquals:
+                          cognito-identity.amazonaws.com:aud: !Ref CognitoIdentityPool
+                      ForAnyValue:StringLike:
+                          cognito-identity.amazonaws.com:amr: unauthenticated
+          RoleName: ${self:custom.stage}-${self:service}-unauthenticated-role
+    
+    CognitoIdentityPoolRoleAttachment: # Manages the roles for the identity pool
+      Type: AWS::Cognito::IdentityPoolRoleAttachment
+      Properties: 
+        IdentityPoolId: !Ref CognitoIdentityPool
+        RoleMappings: 
+          "userpool":
+            AmbiguousRoleResolution: AuthenticatedRole
+            IdentityProvider: !Join [ "", ["${self:resources.Outputs.CognitoIdentityPoolProviderName.Value}", ":", !Ref CognitoUserPoolWebClient], ]
+            Type: Token
+        Roles: 
+          "authenticated": !GetAtt AuthenticatedRole.Arn 
+          "unauthenticated": !GetAtt UnauthenticatedRole.Arn
+  
+  Outputs:
+    CognitoIdentityPoolProviderName:
+      Value: !Join [ "", ["cognito-idp.${self:provider.region}.amazonaws.com", "/", !Ref CognitoUserPool]]
+      Export:
+        Name: ${self:custom.stage}-${self:service}-ExtCognitoIdentityPoolProviderName
